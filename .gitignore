@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+backend/data/*.json
+backend/data/chunk_store.json
+backend/data/kb/*.pdf
+node_modules/
+dist/
+.DS_Store
