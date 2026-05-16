@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     )
     data_dir: str = Field(default="./data", validation_alias="DATA_DIR")
 
+    # --- Context / token budgets ---
+    session_max_messages: int = Field(default=16, validation_alias="SESSION_MAX_MESSAGES")
+    rag_top_k: int = Field(default=4, validation_alias="RAG_TOP_K")
+    rag_chunk_max_chars: int = Field(default=480, validation_alias="RAG_CHUNK_MAX_CHARS")
+    aggregate_summary_max_chars: int = Field(
+        default=800,
+        validation_alias="AGGREGATE_SUMMARY_MAX_CHARS",
+    )
+
     @field_validator("openai_api_base")
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:

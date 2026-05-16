@@ -16,6 +16,12 @@ from pydantic import BaseModel, Field
 from app.agents.payment_agent import run_payment_agent
 from app.agents.risk_agent import run_risk_agent
 from app.agents.wallet_agent import run_wallet_agent
+from app.core.config import get_settings
+from app.core.context import (
+    compact_agent_outputs_for_aggregate,
+    extract_agent_text,
+    should_skip_aggregate,
+)
 from app.graph.state import GraphState
 from app.services.llm import get_chat_model
 
@@ -44,17 +50,7 @@ _txn_re = re.compile(r"(?:订单|交易|txn|TXN)[\s:：#-]*([A-Za-z0-9_-]{6,})",
 
 
 async def classify_intent(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """
-    Classify the latest user intent and populate routing fields.
-
-    Args:
-        state: Current graph state including ``messages``.
-        config: Optional runnable config for tracing.
-
-    Returns:
-        Partial state with ``task_type``, ``sub_tasks``, ``confidence``,
-        ``needs_human``, ``user_context`` enrichments, and ``stream_events``.
-    """
+    """Classify the latest user intent and populate routing fields."""
     structured = get_chat_model().with_structured_output(IntentSchema)
     last = ""
     for m in reversed(state["messages"]):
@@ -63,11 +59,9 @@ async def classify_intent(state: GraphState, config: RunnableConfig | None = Non
             break
     sys = SystemMessage(
         content=(
-            "你是客服调度中枢。根据用户最新输入，选择 task_type 与 sub_tasks。"
-            "sub_tasks 只能包含 payment/risk/wallet 之一或多个。"
-            "涉及退款/支付失败/手续费走 payment；实名/风控/拦截走 risk；"
-            "余额/账单/凭证走 wallet；跨域问题用 mixed。"
-            "若用户要求转人工、辱骂、或完全无关且无法服务，needs_human=true。"
+            "客服调度：选 task_type 与 sub_tasks（payment/risk/wallet）。"
+            "退款/支付→payment；风控→risk；余额/账单→wallet；要转人工→needs_human=true。"
+            "尽量只选必要专家，避免 mixed 时全选。"
         )
     )
     intent: IntentSchema = await structured.ainvoke(
@@ -85,40 +79,25 @@ async def classify_intent(state: GraphState, config: RunnableConfig | None = Non
     m = _txn_re.search(last)
     if m:
         ctx["last_transaction_id"] = m.group(1)
-    events = [
-        {
-            "type": "thinking",
-            "agent": "supervisor",
-            "detail": f"classify intent={intent.task_type} sub={sub} conf={intent.confidence}",
-        }
-    ]
     return {
         "task_type": intent.task_type,
         "sub_tasks": sub,
         "confidence": intent.confidence,
         "needs_human": intent.needs_human,
         "user_context": ctx,
-        "stream_events": events,
+        "stream_events": [
+            {
+                "type": "thinking",
+                "agent": "supervisor",
+                "detail": f"classify intent={intent.task_type} sub={sub} conf={intent.confidence}",
+            }
+        ],
         "tool_failure_streak": 0,
     }
 
 
 async def dispatch_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """
-    Normalise ``sub_tasks`` ordering for deterministic specialist execution.
-
-    Args:
-        state: Graph state.
-        config: Runnable config.
-
-    Returns:
-        Partial state update (ordering + thinking event).
-
-    Notes:
-        Specialists are wired **serially** (payment → risk → wallet) to avoid
-        ambiguous fan-in while still allowing each node to no-op when inactive.
-        TODO: replace with ``Send`` parallel fan-out + join when scale requires it.
-    """
+    """Normalise ``sub_tasks`` ordering for deterministic specialist execution."""
     order = ["payment", "risk", "wallet"]
     sub = [t for t in order if t in set(state.get("sub_tasks", []))]
     return {
@@ -127,32 +106,58 @@ async def dispatch_node(state: GraphState, config: RunnableConfig | None = None)
             {
                 "type": "thinking",
                 "agent": "supervisor",
-                "detail": f"dispatch serial order={sub}",
+                "detail": f"dispatch order={sub}",
             }
         ],
     }
 
 
-async def aggregate_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
+async def finalize_direct_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
     """
-    Merge specialist outputs into a single user-facing Chinese reply.
+    Use a single specialist summary as the final reply (skips aggregate LLM).
 
-    Args:
-        state: Graph state after specialists.
-        config: Runnable config.
-
-    Returns:
-        Partial state with ``final_response`` and optional ``needs_human`` escalation.
+    Streams tokens via LangGraph custom writer for SSE clients.
     """
+    sub = state.get("sub_tasks") or []
     outputs = state.get("agent_outputs") or {}
-    sys = SystemMessage(
-        content=(
-            "你是客服总线，请将各专家 JSON 输出整合为一段连贯中文答复。"
-            "不要暴露内部 JSON；若存在冲突，以风控结论优先。"
-            "如需要用户补充材料，清楚列出。"
-        )
+    text = ""
+    if len(sub) == 1:
+        text = extract_agent_text(sub[0], outputs.get(sub[0]) or {})
+    if not text:
+        for agent in sub:
+            text = extract_agent_text(agent, outputs.get(agent) or {})
+            if text:
+                break
+    text = text.strip()
+    writer = get_stream_writer()
+    for i in range(0, len(text), 48):
+        writer({"sse_event": "token", "text": text[i : i + 48]})
+    needs = bool(state.get("needs_human"))
+    updates: dict[str, Any] = {
+        "final_response": text,
+        "stream_events": [
+            {
+                "type": "thinking",
+                "agent": "supervisor",
+                "detail": "finalize_direct (skipped aggregate LLM)",
+            }
+        ],
+    }
+    if text and not needs:
+        updates["messages"] = [AIMessage(content=text)]
+    return updates
+
+
+async def aggregate_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
+    """Merge specialist summaries into one user-facing Chinese reply."""
+    settings = get_settings()
+    outputs = state.get("agent_outputs") or {}
+    compact = compact_agent_outputs_for_aggregate(
+        outputs,
+        settings.aggregate_summary_max_chars,
     )
-    human = HumanMessage(content=json.dumps({"agent_outputs": outputs}, ensure_ascii=False))
+    sys = SystemMessage(content="整合以下专家摘要为一段中文客服回复；冲突以 risk 为准；勿暴露 JSON。")
+    human = HumanMessage(content=json.dumps(compact, ensure_ascii=False))
     llm = get_chat_model()
     writer = get_stream_writer()
     text_parts: list[str] = []
@@ -173,34 +178,28 @@ async def aggregate_node(state: GraphState, config: RunnableConfig | None = None
         "needs_human": needs,
         "stream_events": [{"type": "thinking", "agent": "supervisor", "detail": "aggregate complete"}],
     }
-    if not needs:
+    if text and not needs:
         updates["messages"] = [AIMessage(content=text)]
     return updates
 
 
 async def human_handoff_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """
-    Prepare a handoff message with compact transcript context for human agents.
-
-    Args:
-        state: Graph state.
-        config: Runnable config.
-
-    Returns:
-        Partial state with ``final_response`` updated for user visibility.
-    """
+    """Prepare a handoff message with compact transcript context for human agents."""
     tail = []
-    for m in state["messages"][-8:]:
+    for m in state["messages"][-6:]:
         role = m.type if hasattr(m, "type") else m.__class__.__name__
-        tail.append(f"{role}: {m.content}")
+        tail.append(f"{role}: {str(m.content)[:400]}")
     transcript = "\n".join(tail)
     base = state.get("final_response") or "我们已为你连接人工客服，请稍候。"
     msg = (
         base
-        + "\n\n---\n已为你创建人工工单，以下为上下文摘要：\n"
-        + transcript[:2000]
+        + "\n\n---\n工单上下文摘要：\n"
+        + transcript[:1500]
         + "\n（TODO：推送到工单系统/IM）"
     )
+    writer = get_stream_writer()
+    for i in range(0, len(msg), 48):
+        writer({"sse_event": "token", "text": msg[i : i + 48]})
     return {
         "final_response": msg,
         "needs_human": True,
@@ -218,6 +217,41 @@ def route_after_classify(state: GraphState) -> Literal["human_handoff", "dispatc
     return "dispatch"
 
 
+def route_after_dispatch(state: GraphState) -> str:
+    """Enter the first required specialist, or finalize if none."""
+    sub = state.get("sub_tasks") or []
+    if "payment" in sub:
+        return "payment_agent"
+    if "risk" in sub:
+        return "risk_agent"
+    if "wallet" in sub:
+        return "wallet_agent"
+    return "finalize_direct"
+
+
+def route_after_payment(state: GraphState) -> str:
+    """Next specialist after payment, or finish."""
+    sub = set(state.get("sub_tasks") or [])
+    if "risk" in sub:
+        return "risk_agent"
+    if "wallet" in sub:
+        return "wallet_agent"
+    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
+
+
+def route_after_risk(state: GraphState) -> str:
+    """Next specialist after risk, or finish."""
+    sub = set(state.get("sub_tasks") or [])
+    if "wallet" in sub:
+        return "wallet_agent"
+    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
+
+
+def route_after_wallet(state: GraphState) -> str:
+    """After wallet, aggregate or direct finalize."""
+    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
+
+
 def route_after_aggregate(state: GraphState) -> Any:
     """Escalate to human if aggregate flagged ``needs_human``."""
     if state.get("needs_human"):
@@ -226,21 +260,14 @@ def route_after_aggregate(state: GraphState) -> Any:
 
 
 def build_supervisor_graph() -> StateGraph:
-    """
-    Build and return the uncompiled ``StateGraph`` for extension/testing.
-
-    Returns:
-        StateGraph instance ready to be compiled.
-
-    Notes:
-        Compile with ``.compile()`` in callers to attach checkpointers if needed.
-    """
+    """Build and return the uncompiled ``StateGraph`` for extension/testing."""
     g = StateGraph(GraphState)
     g.add_node("classify_intent", classify_intent)
     g.add_node("dispatch", dispatch_node)
     g.add_node("payment_agent", run_payment_agent)
     g.add_node("risk_agent", run_risk_agent)
     g.add_node("wallet_agent", run_wallet_agent)
+    g.add_node("finalize_direct", finalize_direct_node)
     g.add_node("aggregate", aggregate_node)
     g.add_node("human_handoff", human_handoff_node)
 
@@ -248,23 +275,48 @@ def build_supervisor_graph() -> StateGraph:
     g.add_conditional_edges(
         "classify_intent",
         route_after_classify,
+        {"human_handoff": "human_handoff", "dispatch": "dispatch"},
+    )
+    g.add_conditional_edges(
+        "dispatch",
+        route_after_dispatch,
         {
-            "human_handoff": "human_handoff",
-            "dispatch": "dispatch",
+            "payment_agent": "payment_agent",
+            "risk_agent": "risk_agent",
+            "wallet_agent": "wallet_agent",
+            "finalize_direct": "finalize_direct",
         },
     )
-    g.add_edge("dispatch", "payment_agent")
-    g.add_edge("payment_agent", "risk_agent")
-    g.add_edge("risk_agent", "wallet_agent")
-    g.add_edge("wallet_agent", "aggregate")
+    g.add_conditional_edges(
+        "payment_agent",
+        route_after_payment,
+        {
+            "risk_agent": "risk_agent",
+            "wallet_agent": "wallet_agent",
+            "aggregate": "aggregate",
+            "finalize_direct": "finalize_direct",
+        },
+    )
+    g.add_conditional_edges(
+        "risk_agent",
+        route_after_risk,
+        {
+            "wallet_agent": "wallet_agent",
+            "aggregate": "aggregate",
+            "finalize_direct": "finalize_direct",
+        },
+    )
+    g.add_conditional_edges(
+        "wallet_agent",
+        route_after_wallet,
+        {"aggregate": "aggregate", "finalize_direct": "finalize_direct"},
+    )
     g.add_conditional_edges(
         "aggregate",
         route_after_aggregate,
-        {
-            "human_handoff": "human_handoff",
-            END: END,
-        },
+        {"human_handoff": "human_handoff", END: END},
     )
+    g.add_edge("finalize_direct", END)
     g.add_edge("human_handoff", END)
     return g
 

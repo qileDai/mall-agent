@@ -15,6 +15,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, message_to_dict, 
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.core.context import truncate_session_messages
 from app.db.redis import rate_limit_allow, session_get_json, session_set_json
 from app.graph.state import GraphState
 from app.graph.supervisor import compile_supervisor
@@ -112,7 +113,10 @@ async def chat_stream(request: Request, body: ChatStreamRequest) -> StreamingRes
     prior_msgs = _messages_from_store(stored.get("messages", []))
     user_ctx = dict(stored.get("user_context", {}))
 
-    msgs = prior_msgs + [HumanMessage(content=body.message)]
+    msgs = truncate_session_messages(
+        prior_msgs + [HumanMessage(content=body.message)],
+        settings.session_max_messages,
+    )
     init: GraphState = {
         "messages": msgs,
         "session_id": session_id,
@@ -162,8 +166,12 @@ async def chat_stream(request: Request, body: ChatStreamRequest) -> StreamingRes
                 for piece in _chunk_text(text):
                     yield _sse("token", {"text": piece})
                     await asyncio.sleep(0.005)
+            saved_msgs = truncate_session_messages(
+                final_state.get("messages", msgs),
+                settings.session_max_messages,
+            )
             to_save = {
-                "messages": _messages_to_store(final_state.get("messages", msgs)),
+                "messages": _messages_to_store(saved_msgs),
                 "user_context": dict(final_state.get("user_context") or user_ctx),
             }
             await session_set_json(key, to_save, settings.session_ttl_seconds)

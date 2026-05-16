@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
+from app.core.context import recent_dialogue_snippet
 from app.graph.state import GraphState
 from app.services.llm import get_chat_model
 from app.tools.wallet_api import wallet_balance_tool, wallet_bills_tool, wallet_export_voucher_tool
@@ -18,20 +19,22 @@ logger = logging.getLogger(__name__)
 _otp_re = re.compile(r"\b(\d{6})\b")
 
 
-def _last_user_text(messages: Sequence[BaseMessage]) -> str:
-    """Return the latest human utterance or empty string."""
+def _user_prompt(messages: Sequence[BaseMessage]) -> str:
+    """Latest user message with optional one-turn context."""
+    last = ""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
-            return str(m.content)
-    return ""
+            last = str(m.content)
+            break
+    snippet = recent_dialogue_snippet(messages, max_turns=1)
+    if snippet and "\n" in snippet:
+        return f"{snippet}\n\n当前问题: {last}"
+    return last
 
 
 async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
     """
     Execute wallet queries with permission checks tied to risk ``kyc_status``.
-
-    Sensitive exports require simulated OTP ``123456`` (or any 6 digits passed
-    through to the mock tool — demo accepts ``123456`` only).
 
     Args:
         state: LangGraph state after risk classification.
@@ -39,8 +42,6 @@ async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = No
 
     Returns:
         Partial updates for ``agent_outputs`` and ``stream_events``.
-
-    TODO: Integrate hardware token / SMS OTP and signed download URLs.
     """
     if "wallet" not in state.get("sub_tasks", []):
         return {}
@@ -52,35 +53,33 @@ async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = No
         msg = "账户处于风控冻结状态，暂无法提供钱包操作。请联系人工客服。"
         events.append({"type": "thinking", "agent": "wallet", "detail": "blocked by kyc_status"})
         return {
-            "agent_outputs": {"wallet": {"error": "kyc_blocked", "message": msg}},
+            "agent_outputs": {"wallet": {"summary": msg, "error": "kyc_blocked"}},
             "stream_events": events,
         }
 
     user_id = ctx.get("user_id") or "demo-user"
     txn = ctx.get("last_transaction_id") or "demo-txn"
-    user_text = _last_user_text(state["messages"])
+    user_text = _user_prompt(state["messages"])
     otp_match = _otp_re.search(user_text)
     otp = otp_match.group(1) if otp_match else ""
 
     sys = SystemMessage(
         content=(
-            "你是钱包助手，可调用工具：wallet_balance / wallet_bills / wallet_export_voucher。"
-            "仅在用户明确要凭证且语境允许时调用导出；导出需要 OTP。"
-            f"当前用户 {user_id}，默认交易号 {txn}。若用户未提供 OTP，先提示使用演示 OTP 123456。"
+            f"钱包助手，工具: wallet_balance/bills/export_voucher。用户={user_id} 交易={txn}。"
+            "导出需 OTP，演示 OTP 123456。"
         )
     )
     llm = get_chat_model().bind_tools(
         [wallet_balance_tool, wallet_bills_tool, wallet_export_voucher_tool]
     )
-    turn_msgs: list[BaseMessage] = [
-        sys,
-        HumanMessage(content=user_text),
-    ]
+    turn_msgs: list[BaseMessage] = [sys, HumanMessage(content=user_text)]
+    last_ai: AIMessage | None = None
     for _ in range(3):
         ai: AIMessage = await llm.ainvoke(
             turn_msgs,
             config=config or RunnableConfig(tags=["wallet_agent"]),
         )
+        last_ai = ai
         turn_msgs.append(ai)
         if not ai.tool_calls:
             break
@@ -103,23 +102,30 @@ async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = No
             }.get(name)
             if tool_fn is None:
                 turn_msgs.append(
-                    ToolMessage(content="unknown tool", tool_call_id=call["id"])
+                    ToolMessage(content="unknown tool", tool_call_id=str(call.get("id") or "call"))
                 )
                 continue
             try:
                 payload = await tool_fn.ainvoke(args)
-                turn_msgs.append(ToolMessage(content=payload, tool_call_id=call["id"]))
+                turn_msgs.append(ToolMessage(content=payload, tool_call_id=str(call.get("id") or "call")))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("wallet tool failed")
-                turn_msgs.append(ToolMessage(content=f"tool error: {exc}", tool_call_id=call["id"]))
+                turn_msgs.append(
+                    ToolMessage(content=f"tool error: {exc}", tool_call_id=str(call.get("id") or "call"))
+                )
 
-    final_ai: AIMessage = await get_chat_model().ainvoke(
-        turn_msgs + [SystemMessage(content="用中文给出最终答复，简洁礼貌。")],
-        config=config or RunnableConfig(tags=["wallet_agent_final"]),
-    )
+    if last_ai and last_ai.content and not last_ai.tool_calls:
+        out = str(last_ai.content).strip()
+    else:
+        final_ai: AIMessage = await get_chat_model().ainvoke(
+            turn_msgs + [SystemMessage(content="用中文简短答复。")],
+            config=config or RunnableConfig(tags=["wallet_agent_final"]),
+        )
+        out = str(final_ai.content).strip()
+
     ctx["wallet_last_otp_hint"] = "演示环境请使用 OTP：123456"
     return {
-        "agent_outputs": {"wallet": {"summary": str(final_ai.content)}},
+        "agent_outputs": {"wallet": {"summary": out}},
         "user_context": ctx,
-        "stream_events": events + [{"type": "thinking", "agent": "wallet", "detail": "wallet agent done"}],
+        "stream_events": events + [{"type": "thinking", "agent": "wallet", "detail": "done"}],
     }

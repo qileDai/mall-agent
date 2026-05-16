@@ -16,6 +16,19 @@ from app.tools.risk_api import fetch_risk_assessment, freeze_transaction_tempora
 
 logger = logging.getLogger(__name__)
 
+_RISK_ASSESSMENT_KEYS = (
+    "risk_score",
+    "kyc_status",
+    "identity_match",
+    "velocity_flag",
+    "device_trust",
+)
+
+
+def _slim_assessment(assessment: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields needed for LLM adjudication (token savings)."""
+    return {k: assessment[k] for k in _RISK_ASSESSMENT_KEYS if k in assessment}
+
 
 class RiskLLMVerdict(BaseModel):
     """Structured decision emitted by the risk reasoning model."""
@@ -88,20 +101,16 @@ async def run_risk_agent(state: GraphState, config: RunnableConfig | None = None
 
     prior_q = ctx.get("risk_pending_question", "")
     structured = get_chat_model().with_structured_output(RiskLLMVerdict)
+    slim = _slim_assessment(assessment)
     sys = SystemMessage(
-        content=(
-            "你是资深风控审核官。结合 assessment JSON 与用户最新发言做中文裁决。"
-            "decision 只能是 approve/need_docs/reject。"
-            "need_docs 时要列出明确材料并在 user_reply 里直接追问用户。"
-            "若信息严重不足且无法推断，decision 选 need_docs 并说明缺什么。"
-        )
+        content="风控官：据 assessment 与用户发言裁决 approve/need_docs/reject；need_docs 在 user_reply 追问。"
     )
     human = HumanMessage(
         content=json.dumps(
             {
-                "assessment": assessment,
-                "user_latest": user_text,
-                "prior_pending_question": prior_q,
+                "assessment": slim,
+                "user_latest": user_text[:500],
+                "prior_pending_question": (prior_q or "")[:300],
             },
             ensure_ascii=False,
         )
@@ -133,8 +142,11 @@ async def run_risk_agent(state: GraphState, config: RunnableConfig | None = None
     return {
         "agent_outputs": {
             "risk": {
-                "assessment": assessment,
-                "verdict": verdict.model_dump(),
+                "summary": verdict.user_reply,
+                "verdict": {
+                    "decision": verdict.decision,
+                    "confidence": verdict.confidence,
+                },
             }
         },
         "user_context": ctx,

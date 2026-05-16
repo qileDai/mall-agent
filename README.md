@@ -102,6 +102,12 @@ frontend/src/
 
 勿将真实 `OPENAI_API_KEY` 提交到 git。若密钥曾泄露，请在服务商侧轮换。
 
+## 文档
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 组件与数据流  
+- [docs/CODE_WALKTHROUGH_zh.md](docs/CODE_WALKTHROUGH_zh.md) — 按文件阅读代码  
+- [docs/TOKEN_OPTIMIZATION_zh.md](docs/TOKEN_OPTIMIZATION_zh.md) — **上下文 Token 优化总结**
+
 ## 旧文档
 
-`docs/` 下历史说明若与本文冲突，以本 README 为准。
+`docs/` 下其它历史说明若与本文冲突，以本 README 为准。

@@ -12,6 +12,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.core.context import compact_rag_hits
 from app.db import qdrant as qdb
 from app.services.embedding import embed_query
 
@@ -133,16 +134,19 @@ class RagQuery(BaseModel):
     """Arguments for hybrid KB search."""
 
     query: str = Field(description="User question or rewritten query for KB retrieval.")
-    top_k: int = Field(default=6, ge=1, le=20, description="How many chunks to return.")
+    top_k: int = Field(default=4, ge=1, le=12, description="How many chunks to return.")
 
 
 @tool("rag_hybrid_search", args_schema=RagQuery)
-async def rag_hybrid_search_tool(query: str, top_k: int = 6) -> str:
+async def rag_hybrid_search_tool(query: str, top_k: int = 4) -> str:
     """
     Tool: hybrid dense+BM25 retrieval with RRF fusion over internal payment KB.
 
     Returns:
-        JSON string of top passages for the LLM.
+        JSON string of compact passages (text + source only) for the LLM.
     """
-    hits = await hybrid_search(query, top_k=top_k)
-    return json.dumps({"hits": hits}, ensure_ascii=False)
+    settings = get_settings()
+    k = min(top_k, settings.rag_top_k)
+    hits = await hybrid_search(query, top_k=k)
+    compact = compact_rag_hits(hits, settings.rag_chunk_max_chars)
+    return json.dumps({"hits": compact}, ensure_ascii=False)
