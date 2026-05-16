@@ -154,21 +154,31 @@ def default_seed_docs() -> list[dict[str, Any]]:
 
 async def maybe_seed_from_data_dir() -> None:
     """
-    If collection empty, seed demo documents.
+    If collection empty, load ``{DATA_DIR}/kb`` via ingestion CLI logic or demo snippets.
 
-    TODO: Replace with ingestion pipeline (PDF/HTML) and scheduled re-embed.
+    See ``docs/KB_INGESTION_zh.md`` for FAQ / ticket / product doc formats.
     """
     settings = get_settings()
     if not settings.openai_api_key:
         logger.warning("OPENAI_API_KEY missing — skipping Qdrant embedding seed.")
         return
     client = get_qdrant_client()
-    if not await client.collection_exists(settings.qdrant_collection):
-        docs = default_seed_docs()
-        n = await seed_demo_documents(docs)
-        logger.info("Seeded Qdrant with %s points", n)
+    exists = await client.collection_exists(settings.qdrant_collection)
+    empty = True
+    if exists:
+        info = await client.count(collection_name=settings.qdrant_collection, exact=True)
+        empty = info.count == 0
+
+    if exists and not empty:
         return
-    info = await client.count(collection_name=settings.qdrant_collection, exact=True)
-    if info.count == 0:
-        n = await seed_demo_documents(default_seed_docs())
-        logger.info("Seeded empty Qdrant collection with %s points", n)
+
+    from app.services.kb_ingest import ingest_directory, iter_kb_files, kb_root
+
+    root = kb_root()
+    if root.exists() and any(iter_kb_files(root)):
+        n = await ingest_directory(root, replace=False)
+        logger.info("Seeded Qdrant from %s (%s points)", root, n)
+        return
+
+    n = await seed_demo_documents(default_seed_docs())
+    logger.info("Seeded Qdrant with built-in demo (%s points)", n)

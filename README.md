@@ -107,6 +107,7 @@ frontend/src/
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 组件与数据流  
 - [docs/CODE_WALKTHROUGH_zh.md](docs/CODE_WALKTHROUGH_zh.md) — 按文件阅读代码  
 - [docs/TOKEN_OPTIMIZATION_zh.md](docs/TOKEN_OPTIMIZATION_zh.md) — **上下文 Token 优化总结**
+- [docs/KB_INGESTION_zh.md](docs/KB_INGESTION_zh.md) — **FAQ / 工单 / 产品文档入库与向量更新**
 
 ## 旧文档
 

@@ -1,0 +1,4 @@
+{"doc_id": "faq-refund-001", "source": "payment_faq", "topic": "refund", "title": "退款到账时间", "version": "2026-05-01", "text": "退款一般 3-7 个工作日原路退回。若超过 7 个工作日未到账，请提供订单号、支付渠道（微信/支付宝/银行卡）及支付截图，我们将发起通道调单。"}
+{"doc_id": "faq-refund-002", "source": "payment_faq", "topic": "refund", "title": "退款失败", "version": "2026-05-01", "text": "退款失败常见原因：银行卡状态异常、户名不一致、超过退款有效期。请核对原支付账户是否可收款，或联系发卡行确认。"}
+{"doc_id": "faq-cross-001", "source": "payment_faq", "topic": "cross_border", "title": "跨境手续费", "version": "2026-05-01", "text": "跨境支付可能产生发卡行货币转换费及通道手续费，具体以账单为准。商城标价通常不含境外发卡行附加费用。"}
+{"doc_id": "faq-dup-001", "source": "payment_faq", "topic": "duplicate_charge", "title": "重复扣款", "version": "2026-05-01", "text": "若怀疑重复扣款，请提供同一时段银行/第三方支付流水截图。核实后重复部分将原路退回，调单约 5-15 个工作日。"}

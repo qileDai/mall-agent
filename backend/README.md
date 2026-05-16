@@ -23,3 +23,10 @@ uv run python -c "from app.serve import main; main()"
 自查：`Get-Command uvicorn` / `where.exe uvicorn`。
 
 环境变量见仓库根目录 `.env.example`。
+
+知识库（FAQ、历史工单、产品文档）入库与向量更新见 [docs/KB_INGESTION_zh.md](../docs/KB_INGESTION_zh.md)。
+
+```powershell
+uv run python -m app.cli.ingest_kb          # 导入 backend/data/kb
+uv run python -m app.cli.ingest_kb --recreate  # 清空 collection 后全量重导
+```
