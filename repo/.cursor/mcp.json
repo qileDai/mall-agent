@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-jira"
+      ],
+      "env": {
+        "JIRA_EMAIL": "qiledaiqklsjfks@gmail.com",
+        "JIRA_API_TOKEN": "your-api-token",
+        "JIRA_BASE_URL": "https://qiledaiqklsjfks.atlassian.net"
+      }
+    }
+  }
+}

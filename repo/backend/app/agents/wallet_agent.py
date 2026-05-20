@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import RunnableConfig
 
 from app.core.context import recent_dialogue_snippet
+from app.core.prompts import WALLET_FINAL, WALLET_KYC_BLOCKED, wallet_system
 from app.graph.state import GraphState
 from app.services.llm import get_chat_model
 from app.tools.wallet_api import wallet_balance_tool, wallet_bills_tool, wallet_export_voucher_tool
@@ -50,7 +51,7 @@ async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = No
     kyc = ctx.get("kyc_status", "unknown")
     events: list[dict[str, Any]] = []
     if kyc == "blocked":
-        msg = "账户处于风控冻结状态，暂无法提供钱包操作。请联系人工客服。"
+        msg = WALLET_KYC_BLOCKED
         events.append({"type": "thinking", "agent": "wallet", "detail": "blocked by kyc_status"})
         return {
             "agent_outputs": {"wallet": {"summary": msg, "error": "kyc_blocked"}},
@@ -118,7 +119,7 @@ async def run_wallet_agent(state: GraphState, config: RunnableConfig | None = No
         out = str(last_ai.content).strip()
     else:
         final_ai: AIMessage = await get_chat_model().ainvoke(
-            turn_msgs + [SystemMessage(content="用中文简短答复。")],
+            turn_msgs + [SystemMessage(content=WALLET_FINAL)],
             config=config or RunnableConfig(tags=["wallet_agent_final"]),
         )
         out = str(final_ai.content).strip()

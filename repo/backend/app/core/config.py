@@ -83,6 +83,22 @@ class Settings(BaseSettings):
         validation_alias="AGGREGATE_SUMMARY_MAX_CHARS",
     )
 
+    # --- Latency ---
+    enable_fast_route: bool = Field(default=True, validation_alias="ENABLE_FAST_ROUTE")
+    enable_parallel_specialists: bool = Field(
+        default=True,
+        validation_alias="ENABLE_PARALLEL_SPECIALISTS",
+    )
+    payment_direct_rag: bool = Field(
+        default=True,
+        validation_alias="PAYMENT_DIRECT_RAG",
+        description="Payment agent: one RAG call + one LLM (skip tool-calling loop).",
+    )
+    rag_bm25_cache_ttl_seconds: int = Field(default=120, validation_alias="RAG_BM25_CACHE_TTL")
+    rag_embed_cache_ttl_seconds: int = Field(default=300, validation_alias="RAG_EMBED_CACHE_TTL")
+    rag_dense_candidates: int = Field(default=12, validation_alias="RAG_DENSE_CANDIDATES")
+    payment_max_tool_rounds: int = Field(default=2, validation_alias="PAYMENT_MAX_TOOL_ROUNDS")
+
     @field_validator("openai_api_base")
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:

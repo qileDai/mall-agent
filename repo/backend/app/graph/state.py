@@ -69,4 +69,5 @@ class GraphState(TypedDict, total=False):
     user_context: Annotated[UserContext, merge_user_context]
     tool_failure_streak: int
     session_id: str
+    direct_reply: str
     stream_events: Annotated[list[dict[str, Any]], operator.add]

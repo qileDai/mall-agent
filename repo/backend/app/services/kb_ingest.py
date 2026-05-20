@@ -14,6 +14,7 @@ from qdrant_client.http import models as qm
 from app.core.config import get_settings
 from app.db import qdrant as qdb
 from app.services.embedding import embed_texts
+from app.services.rag_cache import invalidate_rag_cache
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ async def upsert_chunks(chunks: Sequence[KBChunk]) -> int:
         for c, vec in zip(chunks, vectors, strict=True)
     ]
     await client.upsert(collection_name=settings.qdrant_collection, points=points)
+    invalidate_rag_cache()
     return len(points)
 
 

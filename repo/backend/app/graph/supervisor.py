@@ -22,6 +22,10 @@ from app.core.context import (
     extract_agent_text,
     should_skip_aggregate,
 )
+from app.core.fast_route import try_fast_route
+from app.core.routing import normalize_sub_tasks
+from app.core.prompts import AGGREGATE, CLASSIFY_INTENT, HUMAN_HANDOFF_SUFFIX
+from app.graph.specialists import run_specialists_parallel
 from app.graph.state import GraphState
 from app.services.llm import get_chat_model
 
@@ -32,49 +36,58 @@ class IntentSchema(BaseModel):
     """Structured routing decision produced by the supervisor classifier."""
 
     task_type: Literal["payment", "risk", "wallet", "mixed", "unknown"] = Field(
-        description="Primary business domain for the latest user message."
+        description="主领域。闲聊/问候无业务→unknown；仅一个领域→对应值；两个及以上→mixed。"
     )
     sub_tasks: list[str] = Field(
         default_factory=list,
-        description="Specialists to invoke: subset of payment/risk/wallet.",
+        description="待执行专家：payment/risk/wallet 的子集。unknown 或纯转人工时可为空。",
     )
-    confidence: float = Field(ge=0.0, le=1.0, description="Routing confidence.")
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="0–1。意图明确≥0.85；略模糊 0.45–0.7；无法判断<0.4。",
+    )
     needs_human: bool = Field(
         default=False,
-        description="True when user explicitly requests human or content is unsafe/ambiguous.",
+        description="true=用户要人工/投诉升级，或涉安全威胁且不宜自动回复。",
     )
-    rationale: str = Field(description="Short internal justification (Chinese ok).")
+    rationale: str = Field(description="内部一句话理由，禁止复制到 user_reply。")
 
 
 _txn_re = re.compile(r"(?:订单|交易|txn|TXN)[\s:：#-]*([A-Za-z0-9_-]{6,})", re.I)
 
 
-async def classify_intent(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """Classify the latest user intent and populate routing fields."""
-    structured = get_chat_model().with_structured_output(IntentSchema)
-    last = ""
+def _last_user_text(state: GraphState) -> str:
+    """Extract latest human message from state."""
     for m in reversed(state["messages"]):
         if isinstance(m, HumanMessage):
-            last = str(m.content)
-            break
-    sys = SystemMessage(
-        content=(
-            "客服调度：选 task_type 与 sub_tasks（payment/risk/wallet）。"
-            "退款/支付→payment；风控→risk；余额/账单→wallet；要转人工→needs_human=true。"
-            "尽量只选必要专家，避免 mixed 时全选。"
-        )
-    )
+            return str(m.content)
+    return ""
+
+
+async def classify_intent(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
+    """Classify intent via keyword fast-path or LLM structured output."""
+    last = _last_user_text(state)
+    settings = get_settings()
+
+    if settings.enable_fast_route:
+        fast = try_fast_route(last)
+        if fast is not None:
+            ctx = dict(state.get("user_context") or {})
+            m = _txn_re.search(last)
+            if m:
+                ctx["last_transaction_id"] = m.group(1)
+            fast["user_context"] = ctx
+            fast["tool_failure_streak"] = 0
+            return fast
+
+    structured = get_chat_model().with_structured_output(IntentSchema)
+    sys = SystemMessage(content=CLASSIFY_INTENT)
     intent: IntentSchema = await structured.ainvoke(
         [sys, HumanMessage(content=last)],
         config=config or RunnableConfig(tags=["classify_intent"]),
     )
-    sub = [s for s in intent.sub_tasks if s in {"payment", "risk", "wallet"}]
-    if intent.task_type == "mixed" and not sub:
-        sub = ["payment", "risk"]
-    if intent.task_type in {"payment", "risk", "wallet"} and intent.task_type not in sub:
-        sub.append(intent.task_type)
-    if not sub and intent.task_type == "unknown":
-        sub = ["payment"]
+    sub = normalize_sub_tasks(intent.task_type, intent.sub_tasks)
     ctx = dict(state.get("user_context") or {})
     m = _txn_re.search(last)
     if m:
@@ -97,27 +110,57 @@ async def classify_intent(state: GraphState, config: RunnableConfig | None = Non
 
 
 async def dispatch_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """Normalise ``sub_tasks`` ordering for deterministic specialist execution."""
+    """Normalise ``sub_tasks`` ordering."""
     order = ["payment", "risk", "wallet"]
     sub = [t for t in order if t in set(state.get("sub_tasks", []))]
     return {
         "sub_tasks": sub,
-        "stream_events": [
-            {
-                "type": "thinking",
-                "agent": "supervisor",
-                "detail": f"dispatch order={sub}",
-            }
-        ],
+        "stream_events": [{"type": "thinking", "agent": "supervisor", "detail": f"dispatch order={sub}"}],
     }
 
 
-async def finalize_direct_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
+async def run_specialists_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
     """
-    Use a single specialist summary as the final reply (skips aggregate LLM).
+    Run specialists in parallel (default) or serially when disabled in settings.
 
-    Streams tokens via LangGraph custom writer for SSE clients.
+    Parallel cuts wall-clock time when multiple agents are active (e.g. payment+risk).
     """
+    settings = get_settings()
+    if settings.enable_parallel_specialists:
+        return await run_specialists_parallel(state, config)
+
+    merged: dict[str, Any] = {}
+    for fn in (run_payment_agent, run_risk_agent, run_wallet_agent):
+        part = await fn(state, config)
+        if not part:
+            continue
+        if "agent_outputs" in part:
+            merged.setdefault("agent_outputs", {}).update(part["agent_outputs"])
+        if "stream_events" in part:
+            merged.setdefault("stream_events", []).extend(part["stream_events"])
+        if "user_context" in part:
+            merged.setdefault("user_context", {}).update(part["user_context"])
+        if part.get("needs_human"):
+            merged["needs_human"] = True
+    return merged
+
+
+async def finalize_direct_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
+    """Use specialist summary or direct_reply as final reply (skips aggregate LLM)."""
+    preset = (state.get("direct_reply") or "").strip()
+    if preset:
+        text = preset
+        writer = get_stream_writer()
+        for i in range(0, len(text), 48):
+            writer({"sse_event": "token", "text": text[i : i + 48]})
+        return {
+            "final_response": text,
+            "messages": [AIMessage(content=text)],
+            "stream_events": [
+                {"type": "thinking", "agent": "supervisor", "detail": "finalize_direct (direct_reply)"}
+            ],
+        }
+
     sub = state.get("sub_tasks") or []
     outputs = state.get("agent_outputs") or {}
     text = ""
@@ -136,11 +179,7 @@ async def finalize_direct_node(state: GraphState, config: RunnableConfig | None 
     updates: dict[str, Any] = {
         "final_response": text,
         "stream_events": [
-            {
-                "type": "thinking",
-                "agent": "supervisor",
-                "detail": "finalize_direct (skipped aggregate LLM)",
-            }
+            {"type": "thinking", "agent": "supervisor", "detail": "finalize_direct (skipped aggregate)"}
         ],
     }
     if text and not needs:
@@ -156,7 +195,7 @@ async def aggregate_node(state: GraphState, config: RunnableConfig | None = None
         outputs,
         settings.aggregate_summary_max_chars,
     )
-    sys = SystemMessage(content="整合以下专家摘要为一段中文客服回复；冲突以 risk 为准；勿暴露 JSON。")
+    sys = SystemMessage(content=AGGREGATE)
     human = HumanMessage(content=json.dumps(compact, ensure_ascii=False))
     llm = get_chat_model()
     writer = get_stream_writer()
@@ -184,19 +223,14 @@ async def aggregate_node(state: GraphState, config: RunnableConfig | None = None
 
 
 async def human_handoff_node(state: GraphState, config: RunnableConfig | None = None) -> dict[str, Any]:
-    """Prepare a handoff message with compact transcript context for human agents."""
+    """Prepare handoff message with compact transcript."""
     tail = []
     for m in state["messages"][-6:]:
         role = m.type if hasattr(m, "type") else m.__class__.__name__
         tail.append(f"{role}: {str(m.content)[:400]}")
     transcript = "\n".join(tail)
-    base = state.get("final_response") or "我们已为你连接人工客服，请稍候。"
-    msg = (
-        base
-        + "\n\n---\n工单上下文摘要：\n"
-        + transcript[:1500]
-        + "\n（TODO：推送到工单系统/IM）"
-    )
+    base = state.get("final_response") or HUMAN_HANDOFF_SUFFIX
+    msg = base + "\n\n---\n工单上下文摘要：\n" + transcript[:1500]
     writer = get_stream_writer()
     for i in range(0, len(msg), 48):
         writer({"sse_event": "token", "text": msg[i : i + 48]})
@@ -208,65 +242,39 @@ async def human_handoff_node(state: GraphState, config: RunnableConfig | None = 
     }
 
 
-def route_after_classify(state: GraphState) -> Literal["human_handoff", "dispatch"]:
-    """Route low-confidence or explicit human requests before specialists."""
+def route_after_classify(
+    state: GraphState,
+) -> Literal["human_handoff", "dispatch", "finalize_direct"]:
+    """Route low-confidence, human, or chitchat before specialists."""
     if state.get("needs_human"):
         return "human_handoff"
     if float(state.get("confidence", 1.0)) < 0.35:
         return "human_handoff"
+    if (state.get("direct_reply") or "").strip():
+        return "finalize_direct"
     return "dispatch"
 
 
-def route_after_dispatch(state: GraphState) -> str:
-    """Enter the first required specialist, or finalize if none."""
-    sub = state.get("sub_tasks") or []
-    if "payment" in sub:
-        return "payment_agent"
-    if "risk" in sub:
-        return "risk_agent"
-    if "wallet" in sub:
-        return "wallet_agent"
-    return "finalize_direct"
-
-
-def route_after_payment(state: GraphState) -> str:
-    """Next specialist after payment, or finish."""
-    sub = set(state.get("sub_tasks") or [])
-    if "risk" in sub:
-        return "risk_agent"
-    if "wallet" in sub:
-        return "wallet_agent"
-    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
-
-
-def route_after_risk(state: GraphState) -> str:
-    """Next specialist after risk, or finish."""
-    sub = set(state.get("sub_tasks") or [])
-    if "wallet" in sub:
-        return "wallet_agent"
-    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
-
-
-def route_after_wallet(state: GraphState) -> str:
-    """After wallet, aggregate or direct finalize."""
-    return "finalize_direct" if should_skip_aggregate(state) else "aggregate"
+def route_after_specialists(state: GraphState) -> str:
+    """After specialists, skip aggregate when a single agent already answered."""
+    if should_skip_aggregate(state):
+        return "finalize_direct"
+    return "aggregate"
 
 
 def route_after_aggregate(state: GraphState) -> Any:
-    """Escalate to human if aggregate flagged ``needs_human``."""
+    """Escalate to human if needed."""
     if state.get("needs_human"):
         return "human_handoff"
     return END
 
 
 def build_supervisor_graph() -> StateGraph:
-    """Build and return the uncompiled ``StateGraph`` for extension/testing."""
+    """Build supervisor graph with parallel specialists node."""
     g = StateGraph(GraphState)
     g.add_node("classify_intent", classify_intent)
     g.add_node("dispatch", dispatch_node)
-    g.add_node("payment_agent", run_payment_agent)
-    g.add_node("risk_agent", run_risk_agent)
-    g.add_node("wallet_agent", run_wallet_agent)
+    g.add_node("specialists", run_specialists_node)
     g.add_node("finalize_direct", finalize_direct_node)
     g.add_node("aggregate", aggregate_node)
     g.add_node("human_handoff", human_handoff_node)
@@ -275,41 +283,17 @@ def build_supervisor_graph() -> StateGraph:
     g.add_conditional_edges(
         "classify_intent",
         route_after_classify,
-        {"human_handoff": "human_handoff", "dispatch": "dispatch"},
-    )
-    g.add_conditional_edges(
-        "dispatch",
-        route_after_dispatch,
         {
-            "payment_agent": "payment_agent",
-            "risk_agent": "risk_agent",
-            "wallet_agent": "wallet_agent",
+            "human_handoff": "human_handoff",
+            "dispatch": "dispatch",
             "finalize_direct": "finalize_direct",
         },
     )
+    g.add_edge("dispatch", "specialists")
     g.add_conditional_edges(
-        "payment_agent",
-        route_after_payment,
-        {
-            "risk_agent": "risk_agent",
-            "wallet_agent": "wallet_agent",
-            "aggregate": "aggregate",
-            "finalize_direct": "finalize_direct",
-        },
-    )
-    g.add_conditional_edges(
-        "risk_agent",
-        route_after_risk,
-        {
-            "wallet_agent": "wallet_agent",
-            "aggregate": "aggregate",
-            "finalize_direct": "finalize_direct",
-        },
-    )
-    g.add_conditional_edges(
-        "wallet_agent",
-        route_after_wallet,
-        {"aggregate": "aggregate", "finalize_direct": "finalize_direct"},
+        "specialists",
+        route_after_specialists,
+        {"finalize_direct": "finalize_direct", "aggregate": "aggregate"},
     )
     g.add_conditional_edges(
         "aggregate",
@@ -322,5 +306,5 @@ def build_supervisor_graph() -> StateGraph:
 
 
 def compile_supervisor():
-    """Compile the supervisor graph with default LangGraph runtime settings."""
+    """Compile the supervisor graph."""
     return build_supervisor_graph().compile()

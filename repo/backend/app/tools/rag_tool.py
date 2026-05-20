@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field
 from app.core.config import get_settings
 from app.core.context import compact_rag_hits
 from app.db import qdrant as qdb
-from app.services.embedding import embed_query
+from app.services.rag_cache import embed_query_cached, get_corpus_and_bm25
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,8 @@ def _rrf(rank_lists: Sequence[Sequence[str]], k: int = 60) -> list[tuple[str, fl
 async def hybrid_search(
     query: str,
     top_k: int = 8,
-    dense_candidates: int = 20,
-    bm25_candidates: int = 50,
+    dense_candidates: int | None = None,
+    bm25_candidates: int = 30,
 ) -> list[dict[str, Any]]:
     """
     Run dense vector search in Qdrant + BM25 over scrolled corpus, fuse with RRF.
@@ -65,27 +66,25 @@ async def hybrid_search(
     TODO: Use Qdrant native sparse vectors + two-stage retrieval for large corpora.
     """
     settings = get_settings()
+    dense_n = dense_candidates if dense_candidates is not None else settings.rag_dense_candidates
     client = qdb.get_qdrant_client()
     if not await client.collection_exists(settings.qdrant_collection):
         return []
 
-    vec = await embed_query(query)
+    corpus_task = asyncio.create_task(get_corpus_and_bm25())
+    vec = await embed_query_cached(query)
+    corpus, bm25 = await corpus_task
+    if not corpus or bm25 is None:
+        return []
+
     dense_hits = await client.search(
         collection_name=settings.qdrant_collection,
         query_vector=vec,
-        limit=dense_candidates,
+        limit=dense_n,
         with_payload=True,
     )
     dense_ids = [str(hit.id) for hit in dense_hits]
 
-    corpus = await qdb.scroll_all_texts()
-    if not corpus:
-        return []
-
-    from rank_bm25 import BM25Okapi  # local import to keep module import light
-
-    tokenized_corpus = [_tokenize(row["text"]) for row in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
     q_tokens = _tokenize(query)
     scores = bm25.get_scores(q_tokens)
     ranked_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
@@ -133,17 +132,17 @@ async def hybrid_search(
 class RagQuery(BaseModel):
     """Arguments for hybrid KB search."""
 
-    query: str = Field(description="User question or rewritten query for KB retrieval.")
-    top_k: int = Field(default=4, ge=1, le=12, description="How many chunks to return.")
+    query: str = Field(description="检索词：用户问题的核心关键词（退款、到账、手续费等）。")
+    top_k: int = Field(default=4, ge=1, le=12, description="返回片段数量，默认 4。")
 
 
 @tool("rag_hybrid_search", args_schema=RagQuery)
 async def rag_hybrid_search_tool(query: str, top_k: int = 4) -> str:
     """
-    Tool: hybrid dense+BM25 retrieval with RRF fusion over internal payment KB.
+    检索支付/退款知识库，返回政策与 FAQ 片段（JSON）。
 
-    Returns:
-        JSON string of compact passages (text + source only) for the LLM.
+    query 用 2–8 个核心词（如「退款时效」「重复扣款」），勿带寒暄。
+    无命中时勿编造政策，应告知用户暂未查到相关规定。
     """
     settings = get_settings()
     k = min(top_k, settings.rag_top_k)

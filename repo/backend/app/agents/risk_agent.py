@@ -10,6 +10,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+from app.core.prompts import RISK_ADJUDICATION, risk_adjudication_human
 from app.graph.state import GraphState
 from app.services.llm import get_chat_model
 from app.tools.risk_api import fetch_risk_assessment, freeze_transaction_temporarily
@@ -34,13 +35,15 @@ class RiskLLMVerdict(BaseModel):
     """Structured decision emitted by the risk reasoning model."""
 
     decision: Literal["approve", "need_docs", "reject"] = Field(
-        description="Business decision for the case under review."
+        description="approve=通过；need_docs=需补材料；reject=拒绝/不予通过。"
     )
-    confidence: float = Field(ge=0.0, le=1.0, description="Model confidence in the decision.")
-    user_reply: str = Field(description="User-facing explanation or follow-up question in Chinese.")
+    confidence: float = Field(ge=0.0, le=1.0, description="对本次裁决的置信度。")
+    user_reply: str = Field(
+        description="直接发给用户的中文（2–5句）：结论+依据+下一步；need_docs 时写清材料清单。",
+    )
     requested_documents: list[str] = Field(
         default_factory=list,
-        description="If need_docs, list concrete materials to request from the user.",
+        description="仅 need_docs：材料简称列表，如「身份证正反面」「银行卡流水」。",
     )
 
 
@@ -102,17 +105,17 @@ async def run_risk_agent(state: GraphState, config: RunnableConfig | None = None
     prior_q = ctx.get("risk_pending_question", "")
     structured = get_chat_model().with_structured_output(RiskLLMVerdict)
     slim = _slim_assessment(assessment)
-    sys = SystemMessage(
-        content="风控官：据 assessment 与用户发言裁决 approve/need_docs/reject；need_docs 在 user_reply 追问。"
-    )
+    sys = SystemMessage(content=RISK_ADJUDICATION)
     human = HumanMessage(
-        content=json.dumps(
-            {
-                "assessment": slim,
-                "user_latest": user_text[:500],
-                "prior_pending_question": (prior_q or "")[:300],
-            },
-            ensure_ascii=False,
+        content=risk_adjudication_human(
+            json.dumps(
+                {
+                    "assessment": slim,
+                    "user_latest": user_text[:500],
+                    "prior_pending_question": (prior_q or "")[:300],
+                },
+                ensure_ascii=False,
+            )
         )
     )
     verdict: RiskLLMVerdict = await structured.ainvoke(
